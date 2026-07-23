@@ -13,9 +13,11 @@ import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
 import com.autolyrics.model.LyricLine
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
@@ -24,9 +26,9 @@ import kotlin.math.sqrt
  * A single spring variable ([animIndex]) chases the target line; both the
  * whole-stack scroll offset and every line's "focus" (scale / brightness /
  * colour) are derived from it, so the active line blooms as the stack glides.
- * The active synced line is filled left-to-right in reading order following
- * the word timestamps, producing a continuous karaoke sweep rather than a
- * per-word snap.
+ * The active synced line is drawn word-by-word: the word currently being sung
+ * blooms (scales up, tints toward the accent, glows) while sung words stay
+ * bright and upcoming words sit dim — an Apple-Music-style per-word karaoke.
  *
  * The view is self-driving: it pulls the playback position from
  * [positionProvider] on every frame, so the caller only needs to push the
@@ -151,7 +153,6 @@ class LyricsView @JvmOverloads constructor(
                 userScrolling = false
                 onUserScrollChanged?.invoke(false)
             }
-            resetKaraokeCache()
         }
         if (contentChanged) requestRebuild() else resume()
     }
@@ -165,7 +166,6 @@ class LyricsView @JvmOverloads constructor(
         if (abs(index - animIndex) > SNAP_JUMP_LINES) {
             animIndex = index.toFloat()
             animVelocity = 0f
-            resetKaraokeCache()
         }
         resume()
     }
@@ -507,6 +507,13 @@ class LyricsView @JvmOverloads constructor(
         }
     }
 
+    /**
+     * Apple-Music-style per-word karaoke: each word is drawn individually so
+     * the one being sung blooms (scales up, tints toward the accent, glows),
+     * words already sung stay at full brightness, and upcoming words sit dim.
+     * Because the current word is recomputed from playback position every
+     * frame, a backward seek naturally makes words un-sing — no cache needed.
+     */
     private fun drawKaraokeLine(
         canvas: Canvas,
         ll: LineLayout,
@@ -514,96 +521,67 @@ class LyricsView @JvmOverloads constructor(
         baseColor: Int,
         alpha: Float
     ) {
-        // Base: whole line in the (bright) active colour.
-        mainPaint.color = baseColor
-        mainPaint.alpha = (alpha * 255).toInt().coerceIn(0, 255)
-        ll.main.draw(canvas)
-
-        val revealChar = karaokeRevealChar(ll, line)
-        if (revealChar <= 0) return
-
-        // Overlay: the sung portion in the highlight colour, revealed in
-        // reading order across wrapped visual lines.
         val layout = ll.main
-        mainPaint.color = highlightColor
-        mainPaint.alpha = (alpha * 255).toInt().coerceIn(0, 255)
-
-        val lineCount = layout.lineCount
-        for (vln in 0 until lineCount) {
-            val lineStart = layout.getLineStart(vln)
-            val lineEnd = layout.getLineEnd(vln)
-            if (revealChar <= lineStart) break
-
-            val bandTop = layout.getLineTop(vln).toFloat()
-            val bandBottom = layout.getLineBottom(vln).toFloat()
-
-            canvas.save()
-            if (revealChar >= lineEnd) {
-                canvas.clipRect(0f, bandTop, width.toFloat(), bandBottom)
-            } else {
-                // Sub-character precision: interpolate the reveal x between the
-                // two nearest glyph boundaries so the sweep glides continuously.
-                // The upper bound is this visual line's right edge — never
-                // getPrimaryHorizontal(lineEnd), which resolves to the NEXT
-                // visual line's leading x on a mid-word wrap and would jump back.
-                val cf = revealChar.coerceIn(lineStart.toFloat(), lineEnd.toFloat())
-                val i0 = floor(cf).toInt().coerceIn(lineStart, maxOf(lineStart, lineEnd - 1))
-                val x0 = layout.getPrimaryHorizontal(i0)
-                val i1 = i0 + 1
-                val x1 = if (i1 >= lineEnd) layout.getLineRight(vln) else layout.getPrimaryHorizontal(i1)
-                val x = x0 + (x1 - x0) * (cf - i0)
-                canvas.clipRect(0f, bandTop, x, bandBottom)
-            }
-            layout.draw(canvas)
-            canvas.restore()
-        }
-    }
-
-    // Cache to keep the reveal monotonic within a line (no backward flicker),
-    // while still receding on a genuine backward seek.
-    private var karaokeLineIdx = -1
-    private var karaokeRevealCache = 0f
-    private var karaokeLastPos = Long.MIN_VALUE
-
-    private fun resetKaraokeCache() {
-        karaokeLineIdx = -1
-        karaokeRevealCache = 0f
-        karaokeLastPos = Long.MIN_VALUE
-    }
-
-    private fun karaokeRevealChar(ll: LineLayout, line: LyricLine): Float {
         val words = line.words
-        if (words.isEmpty()) return 0f
         val pos = safePosition()
-
-        if (targetLine != karaokeLineIdx) {
-            // Moved to a new line — start its sweep fresh.
-            karaokeLineIdx = targetLine
-            karaokeRevealCache = 0f
-        } else if (pos < karaokeLastPos - BACKWARD_SEEK_MS) {
-            // Scrubbed backward inside the current line — let the fill recede.
-            karaokeRevealCache = 0f
-        }
-        karaokeLastPos = pos
 
         var cw = -1
         for (i in words.indices) {
             if (words[i].timeMs <= pos) cw = i else break
         }
-        if (cw < 0) {
-            karaokeRevealCache = 0f
-            return 0f
+        val p = if (cw in words.indices) {
+            val startMs = words[cw].timeMs
+            val endMs = if (cw + 1 < words.size) words[cw + 1].timeMs else startMs + LAST_WORD_MS
+            ((pos - startMs).toFloat() / (endMs - startMs).coerceAtLeast(1L)).coerceIn(0f, 1f)
+        } else 0f
+
+        for (i in words.indices) {
+            val text = words[i].text
+            if (text.isBlank()) continue
+
+            val startChar = ll.wordStart[i]
+            val vln = layout.getLineForOffset(startChar)
+            val x = layout.getPrimaryHorizontal(startChar)
+            val baseline = layout.getLineBaseline(vln).toFloat()
+
+            val sung = i < cw
+            val current = i == cw
+
+            // Opacity ramps word-by-word; the current word fades up as sung.
+            val wordAlpha = when {
+                sung -> 1f
+                current -> 0.5f + 0.5f * smoothstep(p)
+                else -> 0.5f
+            }
+            // Bloom: a rise-and-fall bump while the word is being sung.
+            val bump = if (current) sin(PI.toFloat() * (p * 1.3f).coerceIn(0f, 1f)) else 0f
+            val wordScale = 1f + WORD_BLOOM * bump
+
+            val pivotX = x + mainPaint.measureText(text) / 2f
+            val pivotY = baseline - mainPaint.textSize * 0.32f
+
+            canvas.save()
+            canvas.scale(wordScale, wordScale, pivotX, pivotY)
+
+            // Soft accent glow behind the word currently being sung.
+            if (current && bump > 0.02f) {
+                mainPaint.color = highlightColor
+                mainPaint.alpha = (alpha * 0.4f * bump * 255).toInt().coerceIn(0, 255)
+                canvas.save()
+                canvas.scale(1.06f, 1.06f, pivotX, pivotY)
+                canvas.drawText(text, x, baseline, mainPaint)
+                canvas.restore()
+            }
+
+            // The glyphs: bright when sung, tinting toward the accent at the
+            // peak of the bloom, dim while still upcoming.
+            mainPaint.color =
+                if (current) lerpColor(baseColor, highlightColor, 0.6f * bump) else baseColor
+            mainPaint.alpha = (alpha * wordAlpha * 255).toInt().coerceIn(0, 255)
+            canvas.drawText(text, x, baseline, mainPaint)
+
+            canvas.restore()
         }
-
-        val startMs = words[cw].timeMs
-        val endMs = if (cw + 1 < words.size) words[cw + 1].timeMs else startMs + LAST_WORD_MS
-        val span = (endMs - startMs).coerceAtLeast(1L)
-        val p = ((pos - startMs).toFloat() / span).coerceIn(0f, 1f)
-
-        // Monotonic forward within the line to smooth throttled updates.
-        val reveal = maxOf(ll.wordStart[cw] + p * ll.wordLen[cw], karaokeRevealCache)
-        karaokeRevealCache = reveal
-        return reveal
     }
 
     private fun drawCenteredMessage(canvas: Canvas, msg: String) {
@@ -684,8 +662,8 @@ class LyricsView @JvmOverloads constructor(
         private const val LAST_WORD_MS = 500L
         private const val IDLE_RETURN_NANOS = 8_000_000_000L
         private const val SETTLE_EPS = 0.0015f
-        private const val BACKWARD_SEEK_MS = 400L
         private const val SNAP_JUMP_LINES = 6f
+        private const val WORD_BLOOM = 0.12f
         private val MARGIN_PX = 120f
 
         private fun smoothstep(x: Float): Float {

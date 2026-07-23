@@ -1,18 +1,9 @@
 package com.autolyrics
 
-import android.animation.ValueAnimator
 import android.graphics.Color
-import android.graphics.Typeface
 import android.os.Bundle
-import android.text.SpannableStringBuilder
-import android.text.Spanned
-import android.text.style.AbsoluteSizeSpan
-import android.text.style.BackgroundColorSpan
-import android.text.style.ForegroundColorSpan
-import android.text.style.StyleSpan
 import android.view.View
 import android.view.WindowManager
-import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
@@ -24,9 +15,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.autolyrics.media.MediaTracker
-import com.autolyrics.model.LyricLine
 import com.autolyrics.model.LyricsState
 import com.autolyrics.model.LyricsStatus
+import com.autolyrics.ui.LyricsView
 import kotlinx.coroutines.launch
 
 class PerformanceActivity : AppCompatActivity() {
@@ -38,14 +29,11 @@ class PerformanceActivity : AppCompatActivity() {
     private lateinit var trackTitle: TextView
     private lateinit var trackArtist: TextView
     private lateinit var sourceLabel: TextView
-    private lateinit var prevLine: TextView
-    private lateinit var currentLine: TextView
-    private lateinit var nextLine: TextView
+    private lateinit var lyricsView: LyricsView
     private lateinit var exitHint: TextView
 
-    private var lastRenderedIndex = -1
-    private var lastRenderedWord = -1
-    private var wordPopAnimator: ValueAnimator? = null
+    private var lyricsIdentity = 0
+    private var lastTrackKey: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,12 +49,22 @@ class PerformanceActivity : AppCompatActivity() {
         trackTitle = findViewById(R.id.perf_track_title)
         trackArtist = findViewById(R.id.perf_track_artist)
         sourceLabel = findViewById(R.id.perf_source)
-        prevLine = findViewById(R.id.perf_prev_line)
-        currentLine = findViewById(R.id.perf_current_line)
-        nextLine = findViewById(R.id.perf_next_line)
+        lyricsView = findViewById(R.id.perf_lyrics_view)
         exitHint = findViewById(R.id.perf_exit_hint)
 
         root.setOnClickListener { finish() }
+
+        // Full-screen showcase: large text, centred focal line, no hand-scroll
+        // (so a tap anywhere exits).
+        lyricsView.apply {
+            userScrollEnabled = false
+            focalYFraction = 0.46f
+            setTextSizeSp(30f)
+            activeScale = 1.28f
+            inactiveScale = 0.66f
+            inactiveAlpha = 0.28f
+            positionProvider = { safePosition() }
+        }
 
         exitHint.animate().alpha(0f).setStartDelay(3000).setDuration(1000).start()
 
@@ -74,22 +72,6 @@ class PerformanceActivity : AppCompatActivity() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 mediaTracker.state.collect { state -> render(state) }
             }
-        }
-    }
-
-    override fun onDestroy() {
-        wordPopAnimator?.cancel()
-        wordPopAnimator = null
-        super.onDestroy()
-    }
-
-    private fun enterImmersiveMode() {
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        WindowInsetsControllerCompat(window, window.decorView).let { ctrl ->
-            ctrl.hide(WindowInsetsCompat.Type.systemBars())
-            ctrl.systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
     }
 
@@ -116,154 +98,60 @@ class PerformanceActivity : AppCompatActivity() {
         }
 
         val colors = state.albumColors
-        val accentColor = colors?.vibrant ?: DEFAULT_ACCENT
+        lyricsView.setColors(
+            active = colors?.textPrimary ?: Color.WHITE,
+            inactive = colors?.textDim ?: Color.parseColor("#66FFFFFF"),
+            highlight = colors?.vibrant ?: DEFAULT_ACCENT
+        )
+        lyricsView.isPlaying = state.isPlaying
 
         when (state.status) {
-            LyricsStatus.NO_MEDIA -> {
-                prevLine.text = ""
-                currentLine.text = "Play a song"
-                nextLine.text = ""
-            }
-            LyricsStatus.LOADING -> {
-                prevLine.text = ""
-                currentLine.text = "Loading lyrics…"
-                nextLine.text = ""
-            }
-            LyricsStatus.NOT_FOUND -> {
-                prevLine.text = ""
-                currentLine.text = "No lyrics found"
-                nextLine.text = ""
-            }
-            LyricsStatus.ERROR -> {
-                prevLine.text = ""
-                currentLine.text = "Error loading lyrics"
-                nextLine.text = ""
-            }
-            LyricsStatus.PLAIN_ONLY -> {
-                renderPlain(state)
-            }
-            LyricsStatus.FOUND -> {
-                renderSynced(state, accentColor)
-            }
-        }
-    }
-
-    private fun renderPlain(state: LyricsState) {
-        val lines = state.lines
-        if (lines.isEmpty()) {
-            prevLine.text = ""
-            currentLine.text = "♪"
-            nextLine.text = ""
-            return
-        }
-
-        val durationMs = state.track?.durationMs ?: 0
-        val posMs = try {
-            mediaTracker.getCurrentPositionMs().coerceAtLeast(0)
-        } catch (_: Exception) { 0L }
-
-        val idx = if (durationMs > 0) {
-            ((posMs.toFloat() / durationMs) * lines.size).toInt()
-                .coerceIn(0, lines.size - 1)
-        } else 0
-
-        updateSideLine(prevLine, lines.getOrNull(idx - 1)?.text)
-        currentLine.text = lines[idx].text.ifBlank { "♪" }
-        updateSideLine(nextLine, lines.getOrNull(idx + 1)?.text)
-    }
-
-    private fun renderSynced(state: LyricsState, accentColor: Int) {
-        val idx = state.currentIndex
-        val wordIdx = state.currentWordIndex
-        val lines = state.lines
-
-        if (idx < 0 || idx >= lines.size) {
-            prevLine.text = ""
-            currentLine.text = "♪"
-            nextLine.text = ""
-            return
-        }
-
-        val lineChanged = idx != lastRenderedIndex
-        val wordChanged = wordIdx != lastRenderedWord
-        if (!lineChanged && !wordChanged) return
-
-        lastRenderedIndex = idx
-        lastRenderedWord = wordIdx
-
-        if (lineChanged) {
-            updateSideLine(prevLine, lines.getOrNull(idx - 1)?.text)
-            updateSideLine(nextLine, lines.getOrNull(idx + 1)?.text)
-        }
-
-        val line = lines[idx]
-        val hasKaraoke = line.words.isNotEmpty()
-
-        if (hasKaraoke && wordIdx >= 0) {
-            wordPopAnimator?.cancel()
-
-            val baseSizePx = currentLine.textSize.toInt()
-            val targetSizePx = (baseSizePx * 1.5).toInt()
-            val accentBg = setAlpha(accentColor, 0.30f)
-
-            wordPopAnimator = ValueAnimator.ofFloat(1.0f, 1.5f).apply {
-                duration = 220
-                interpolator = OvershootInterpolator(1.5f)
-                addUpdateListener { anim ->
-                    val scale = anim.animatedValue as Float
-                    val sizePx = (baseSizePx * scale).toInt()
-                    currentLine.text = buildKaraokeSpannable(
-                        line, wordIdx, sizePx, accentColor, accentBg
-                    )
+            LyricsStatus.NO_MEDIA -> lyricsView.setMessage("Play a song")
+            LyricsStatus.LOADING -> lyricsView.setMessage("Loading lyrics…")
+            LyricsStatus.NOT_FOUND -> lyricsView.setMessage("No lyrics found")
+            LyricsStatus.ERROR -> lyricsView.setMessage("Error loading lyrics")
+            LyricsStatus.PLAIN_ONLY, LyricsStatus.FOUND -> {
+                val plain = state.status == LyricsStatus.PLAIN_ONLY
+                bumpIdentityIfTrackChanged(state)
+                lyricsView.setLyrics(
+                    newLines = state.lines,
+                    newTranslations = state.translatedLines,
+                    plain = plain,
+                    durationMs = state.track?.durationMs ?: 0L,
+                    linesId = lyricsIdentity
+                )
+                if (!plain && state.currentIndex >= 0) {
+                    lyricsView.setActiveLine(state.currentIndex)
                 }
-                start()
             }
-        } else {
-            wordPopAnimator?.cancel()
-            currentLine.text = line.text.ifBlank { "♪" }
         }
     }
 
-    private fun buildKaraokeSpannable(
-        line: LyricLine,
-        activeWordIdx: Int,
-        activeSizePx: Int,
-        accentColor: Int,
-        accentBg: Int
-    ): SpannableStringBuilder {
-        val ssb = SpannableStringBuilder()
-        line.words.forEachIndexed { wi, word ->
-            val start = ssb.length
-            ssb.append(word.text)
-            val end = ssb.length
-
-            if (wi == activeWordIdx) {
-                ssb.setSpan(AbsoluteSizeSpan(activeSizePx), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                ssb.setSpan(StyleSpan(Typeface.BOLD), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                ssb.setSpan(ForegroundColorSpan(accentColor), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                ssb.setSpan(BackgroundColorSpan(accentBg), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            }
-
-            if (wi < line.words.size - 1) ssb.append(" ")
+    private fun bumpIdentityIfTrackChanged(state: LyricsState) {
+        val key = "${state.track?.title}|${state.track?.artist}|${state.status}"
+        if (key != lastTrackKey) {
+            lastTrackKey = key
+            lyricsIdentity++
         }
-        return ssb
     }
 
-    private fun updateSideLine(tv: TextView, text: String?) {
-        val newText = text ?: ""
-        if (tv.text.toString() == newText) return
-        tv.animate().alpha(0f).setDuration(100).withEndAction {
-            tv.text = newText
-            tv.animate().alpha(1f).setDuration(180).start()
-        }.start()
+    private fun safePosition(): Long = try {
+        mediaTracker.getCurrentPositionMs()
+    } catch (_: Exception) {
+        0L
+    }
+
+    private fun enterImmersiveMode() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        WindowInsetsControllerCompat(window, window.decorView).let { ctrl ->
+            ctrl.hide(WindowInsetsCompat.Type.systemBars())
+            ctrl.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
     }
 
     companion object {
         private val DEFAULT_ACCENT = Color.parseColor("#FFD54F")
-
-        private fun setAlpha(color: Int, alpha: Float): Int {
-            val a = (alpha * 255).toInt().coerceIn(0, 255)
-            return Color.argb(a, Color.red(color), Color.green(color), Color.blue(color))
-        }
     }
 }

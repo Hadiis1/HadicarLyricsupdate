@@ -30,8 +30,11 @@ AutoLyricsApp (Application)
        └─ AlbumColorExtractor — Palette API color extraction
 
   Phone UI
-  ├─ MainActivity — main lyrics view, settings, sync tools
-  └─ PerformanceActivity — full-screen immersive karaoke view
+  ├─ LyricsView — Canvas-drawn Apple-Music-style animated lyric stack (spring
+  │    scroll, per-line focus scale/alpha/color, reading-order karaoke sweep);
+  │    shared by both phone screens
+  ├─ MainActivity — main lyrics view (hosts LyricsView), settings, sync tools
+  └─ PerformanceActivity — full-screen immersive view (hosts LyricsView, large text)
 
   Android Auto
   ├─ LyricsBrowserService (MediaBrowserServiceCompat)
@@ -49,8 +52,9 @@ AutoLyricsApp (Application)
 | File | Purpose |
 |---|---|
 | `AutoLyricsApp.kt` | Application class. Initializes `MediaTracker`, starts `LyricsBrowserService`. |
-| `MainActivity.kt` | Phone UI: lyrics display, font/delay settings, tap-to-sync, audio sync, scroll handling, theme colors. |
-| `PerformanceActivity.kt` | Full-screen immersive karaoke mode with large text and word pop-out effect. |
+| `MainActivity.kt` | Phone UI: hosts `LyricsView`, font/delay settings, tap-to-sync, audio sync, jump-to-current, theme colors. |
+| `PerformanceActivity.kt` | Full-screen immersive mode: hosts `LyricsView` with large text, centred focal line, tap-to-exit. |
+| `ui/LyricsView.kt` | Canvas-drawn animated lyric stack. Single spring (`animIndex`) drives scroll + per-line focus (scale/alpha/color); reading-order karaoke reveal via per-visual-line clip; plain-mode proportional drift; drag/fling browse + idle return; self-driving Choreographer loop that idles when nothing animates. |
 | `model/Models.kt` | Data classes: `TrackInfo`, `LyricWord`, `LyricLine`, `AlbumColors`, `LyricsStatus`, `LyricsState`. |
 | `media/MediaTracker.kt` | Singleton. Tracks active media session, fetches lyrics, manages offset, emits `StateFlow<LyricsState>`. |
 | `media/MediaListenerService.kt` | `NotificationListenerService` — detects media sessions. |

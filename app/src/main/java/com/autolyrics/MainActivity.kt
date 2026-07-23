@@ -1,6 +1,5 @@
 package com.autolyrics
 
-import android.animation.ValueAnimator
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Color
@@ -8,22 +7,13 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
-import android.text.SpannableStringBuilder
-import android.text.Spanned
-import android.text.style.BackgroundColorSpan
-import android.text.style.ForegroundColorSpan
-import android.text.style.RelativeSizeSpan
-import android.text.style.StyleSpan
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
-import android.view.MotionEvent
 import android.view.View
-import android.view.animation.LinearInterpolator
 import android.widget.Button
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.widget.SwitchCompat
 import androidx.appcompat.app.AppCompatActivity
@@ -35,6 +25,7 @@ import com.autolyrics.media.MediaTracker
 import com.autolyrics.model.AlbumColors
 import com.autolyrics.model.LyricsState
 import com.autolyrics.model.LyricsStatus
+import com.autolyrics.ui.LyricsView
 import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
@@ -50,8 +41,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ivAlbumArt: ImageView
     private lateinit var tvTrack: TextView
     private lateinit var tvSource: TextView
-    private lateinit var tvLyrics: TextView
-    private lateinit var scrollView: ScrollView
+    private lateinit var lyricsView: LyricsView
     private lateinit var delayBar: LinearLayout
     private lateinit var tvDelay: TextView
     private lateinit var divider: View
@@ -62,16 +52,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvAaDelay: TextView
     private lateinit var btnJumpToCurrent: Button
     private lateinit var prefs: SharedPreferences
-    private var lastScrolledIndex = -1
     private var currentColors: AlbumColors? = null
     private var lyricsFontSizeSp = 16
     private var lyricsFontFamily = "sans-serif"
     private var aaOffsetMs = 0L
-    private var userScrolling = false
-    private var userTouching = false
 
-    private var plainScrollAnimator: ValueAnimator? = null
-    private var lastPlainTrackTitle: String? = null
+    private var lyricsIdentity = 0
+    private var lastLyricsKey: String? = null
 
     private lateinit var btnTapSync: Button
     private lateinit var tvSyncStatus: TextView
@@ -80,10 +67,6 @@ class MainActivity : AppCompatActivity() {
     private var tapSyncOffsets = mutableListOf<Long>()
 
     private val fontButtons = mutableMapOf<String, Button>()
-    private val scrollResetRunnable = Runnable {
-        userScrolling = false
-        btnJumpToCurrent.visibility = View.GONE
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -101,8 +84,7 @@ class MainActivity : AppCompatActivity() {
         ivAlbumArt = findViewById(R.id.iv_album_art)
         tvTrack = findViewById(R.id.tv_track)
         tvSource = findViewById(R.id.tv_source)
-        tvLyrics = findViewById(R.id.tv_lyrics)
-        scrollView = findViewById(R.id.scroll_lyrics)
+        lyricsView = findViewById(R.id.lyrics_view)
         delayBar = findViewById(R.id.layout_delay)
         tvDelay = findViewById(R.id.tv_delay)
         divider = findViewById(R.id.divider)
@@ -110,7 +92,7 @@ class MainActivity : AppCompatActivity() {
         ivAlbumArt.clipToOutline = true
         btnJumpToCurrent = findViewById(R.id.btn_jump_to_current)
 
-        setupScrollDetection()
+        setupLyricsView()
 
         btnPermission.setOnClickListener {
             startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
@@ -258,66 +240,70 @@ class MainActivity : AppCompatActivity() {
                         tvSource.visibility = View.GONE
                     }
 
-                    if (state.status != LyricsStatus.PLAIN_ONLY) {
-                        stopPlainScroll()
-                    } else {
-                        plainScrollAnimator?.let { anim ->
-                            if (state.isPlaying && anim.isPaused) anim.resume()
-                            else if (!state.isPlaying && anim.isRunning) anim.pause()
-                        }
-                    }
-
-                    when (state.status) {
-                        LyricsStatus.NO_MEDIA -> {
-                            tvLyrics.text = "Play a song to see lyrics here.\n\nLyrics will also appear on Android Auto."
-                        }
-                        LyricsStatus.LOADING -> {
-                            tvLyrics.text = "Loading lyrics…"
-                        }
-                        LyricsStatus.NOT_FOUND -> {
-                            tvLyrics.text = "No lyrics found for this track."
-                        }
-                        LyricsStatus.ERROR -> {
-                            tvLyrics.text = "Error loading lyrics.\nCheck your internet connection."
-                        }
-                        LyricsStatus.FOUND -> {
-                            renderSyncedLyrics(state)
-                        }
-                        LyricsStatus.PLAIN_ONLY -> {
-                            stopPlainScroll()
-                            val hasTrans = state.translatedLines != null
-                            val sb = SpannableStringBuilder()
-                            sb.append("ℹ  Lyrics are not synced to playback\n\n")
-                            sb.append("─────────────────────\n\n")
-                            val dimColor = state.albumColors?.textDim ?: DEFAULT_DIM
-                            state.lines.forEachIndexed { i, line ->
-                                sb.append("${line.text}\n")
-                                if (hasTrans) {
-                                    val tl = state.translatedLines?.getOrNull(i)
-                                    if (!tl.isNullOrBlank()) {
-                                        val tlStart = sb.length
-                                        sb.append("$tl\n")
-                                        sb.setSpan(
-                                            RelativeSizeSpan(0.8f),
-                                            tlStart, sb.length,
-                                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                                        )
-                                        sb.setSpan(
-                                            ForegroundColorSpan(dimColor),
-                                            tlStart, sb.length,
-                                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                                        )
-                                    }
-                                }
-                                sb.append("\n")
-                            }
-                            tvLyrics.text = sb
-                            startPlainScroll(state)
-                        }
-                    }
+                    renderLyrics(state)
                 }
             }
         }
+    }
+
+    private fun setupLyricsView() {
+        lyricsView.apply {
+            userScrollEnabled = true
+            focalYFraction = 0.4f
+            activeScale = 1.14f
+            inactiveScale = 0.9f
+            inactiveAlpha = 0.45f
+            positionProvider = { safePosition() }
+            onUserScrollChanged = { scrolling ->
+                btnJumpToCurrent.visibility = if (scrolling) View.VISIBLE else View.GONE
+            }
+        }
+        btnJumpToCurrent.setOnClickListener {
+            btnJumpToCurrent.visibility = View.GONE
+            lyricsView.returnToCurrent()
+        }
+    }
+
+    private fun renderLyrics(state: LyricsState) {
+        lyricsView.isPlaying = state.isPlaying
+        when (state.status) {
+            LyricsStatus.NO_MEDIA -> lyricsView.setMessage(
+                "Play a song to see lyrics here.\n\nLyrics will also appear on Android Auto."
+            )
+            LyricsStatus.LOADING -> lyricsView.setMessage("Loading lyrics…")
+            LyricsStatus.NOT_FOUND -> lyricsView.setMessage("No lyrics found for this track.")
+            LyricsStatus.ERROR -> lyricsView.setMessage(
+                "Error loading lyrics.\nCheck your internet connection."
+            )
+            LyricsStatus.FOUND, LyricsStatus.PLAIN_ONLY -> {
+                val plain = state.status == LyricsStatus.PLAIN_ONLY
+                bumpIdentityIfChanged(state)
+                lyricsView.setLyrics(
+                    newLines = state.lines,
+                    newTranslations = state.translatedLines,
+                    plain = plain,
+                    durationMs = state.track?.durationMs ?: 0L,
+                    linesId = lyricsIdentity
+                )
+                if (!plain && state.currentIndex >= 0) {
+                    lyricsView.setActiveLine(state.currentIndex)
+                }
+            }
+        }
+    }
+
+    private fun bumpIdentityIfChanged(state: LyricsState) {
+        val key = "${state.track?.title}|${state.track?.artist}|${state.status}"
+        if (key != lastLyricsKey) {
+            lastLyricsKey = key
+            lyricsIdentity++
+        }
+    }
+
+    private fun safePosition(): Long = try {
+        mediaTracker.getCurrentPositionMs()
+    } catch (_: Exception) {
+        0L
     }
 
     private fun updateAlbumArt(state: LyricsState) {
@@ -349,7 +335,7 @@ class MainActivity : AppCompatActivity() {
             tvAppTitle.setTextColor(colors.textPrimary)
             tvAppSubtitle.setTextColor(colors.textDim)
             tvTrack.setTextColor(colors.vibrant)
-            tvLyrics.setTextColor(colors.textPrimary)
+            lyricsView.setColors(colors.textPrimary, colors.textDim, colors.vibrant)
         } else {
             rootLayout.setBackgroundColor(DEFAULT_BG)
             appBar.setBackgroundColor(DEFAULT_APP_BAR)
@@ -359,7 +345,11 @@ class MainActivity : AppCompatActivity() {
             tvAppTitle.setTextColor(Color.parseColor("#E0E0FF"))
             tvAppSubtitle.setTextColor(Color.parseColor("#8888AA"))
             tvTrack.setTextColor(Color.parseColor("#BB86FC"))
-            tvLyrics.setTextColor(Color.parseColor("#CCCCDD"))
+            lyricsView.setColors(
+                Color.parseColor("#F5F5FF"),
+                Color.parseColor("#7A7A96"),
+                DEFAULT_HIGHLIGHT
+            )
         }
     }
 
@@ -378,111 +368,13 @@ class MainActivity : AppCompatActivity() {
         tvDelay.text = "Phone Sync: ${sign}${offsetMs}ms"
     }
 
-    private fun renderSyncedLyrics(state: LyricsState) {
-        val ssb = SpannableStringBuilder()
-        val hasKaraoke = state.lines.any { it.words.isNotEmpty() }
-        val colors = state.albumColors
-        val highlightColor = colors?.vibrant ?: DEFAULT_HIGHLIGHT
-        val highlightBg = setAlpha(highlightColor, 0.2f)
-        val dimColor = colors?.textDim ?: DEFAULT_DIM
-
-        state.lines.forEachIndexed { i, line ->
-            val isCurrentLine = i == state.currentIndex
-            val lineStart = ssb.length
-
-            if (isCurrentLine) {
-                ssb.append("▶  ")
-            } else {
-                ssb.append("    ")
-            }
-
-            if (isCurrentLine && hasKaraoke && line.words.isNotEmpty()) {
-                line.words.forEachIndexed { wi, word ->
-                    val wordStart = ssb.length
-                    ssb.append(word.text)
-                    val wordEnd = ssb.length
-
-                    if (wi == state.currentWordIndex) {
-                        ssb.setSpan(
-                            StyleSpan(Typeface.BOLD),
-                            wordStart, wordEnd,
-                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                        )
-                        ssb.setSpan(
-                            ForegroundColorSpan(highlightColor),
-                            wordStart, wordEnd,
-                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                        )
-                        ssb.setSpan(
-                            BackgroundColorSpan(highlightBg),
-                            wordStart, wordEnd,
-                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                        )
-                    }
-
-                    if (wi < line.words.size - 1) ssb.append(" ")
-                }
-                ssb.setSpan(
-                    StyleSpan(Typeface.BOLD),
-                    lineStart, ssb.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-            } else {
-                ssb.append(line.text)
-                if (isCurrentLine) {
-                    ssb.setSpan(
-                        StyleSpan(Typeface.BOLD),
-                        lineStart, ssb.length,
-                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                    )
-                }
-            }
-
-            if (!isCurrentLine) {
-                ssb.setSpan(
-                    ForegroundColorSpan(dimColor),
-                    lineStart, ssb.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-            }
-
-            val translatedLine = state.translatedLines?.getOrNull(i)
-            if (!translatedLine.isNullOrBlank()) {
-                ssb.append("\n")
-                val tlStart = ssb.length
-                ssb.append("    $translatedLine")
-                ssb.setSpan(
-                    RelativeSizeSpan(0.8f),
-                    tlStart, ssb.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-                ssb.setSpan(
-                    ForegroundColorSpan(dimColor),
-                    tlStart, ssb.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-            }
-
-            ssb.append("\n\n")
-        }
-
-        tvLyrics.text = ssb
-
-        if (state.currentIndex != lastScrolledIndex && state.currentIndex >= 0) {
-            lastScrolledIndex = state.currentIndex
-            if (!userScrolling) {
-                autoScrollToCurrentLine(state.currentIndex, state.lines.size)
-            }
-        }
-    }
-
     override fun onResume() {
         super.onResume()
         updatePermissionUi()
     }
 
     override fun onDestroy() {
-        stopPlainScroll()
+        handler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
 
@@ -508,53 +400,6 @@ class MainActivity : AppCompatActivity() {
         return flat?.contains(component.flattenToString()) == true
     }
 
-    @SuppressLint("ClickableViewAccessibility")
-    private fun setupScrollDetection() {
-        scrollView.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    userTouching = true
-                    handler.removeCallbacks(scrollResetRunnable)
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    userTouching = false
-                    if (userScrolling) {
-                        handler.removeCallbacks(scrollResetRunnable)
-                        handler.postDelayed(scrollResetRunnable, 8000)
-                    }
-                }
-            }
-            false
-        }
-
-        scrollView.setOnScrollChangeListener { _, _, _, _, _ ->
-            if (userTouching && !userScrolling) {
-                userScrolling = true
-                btnJumpToCurrent.visibility = View.VISIBLE
-            }
-        }
-
-        btnJumpToCurrent.setOnClickListener {
-            userScrolling = false
-            btnJumpToCurrent.visibility = View.GONE
-            handler.removeCallbacks(scrollResetRunnable)
-            val state = mediaTracker.state.value
-            if (state.currentIndex >= 0) {
-                lastScrolledIndex = state.currentIndex
-                autoScrollToCurrentLine(state.currentIndex, state.lines.size)
-            }
-        }
-    }
-
-    private fun autoScrollToCurrentLine(currentIndex: Int, totalLines: Int) {
-        if (totalLines == 0) return
-        scrollView.post {
-            val targetY = (currentIndex.toFloat() / totalLines * tvLyrics.height).toInt()
-            val offset = scrollView.height / 3
-            scrollView.smoothScrollTo(0, maxOf(0, targetY - offset))
-        }
-    }
-
     private fun updateAaDelayDisplay() {
         val sign = if (aaOffsetMs > 0) "+" else ""
         tvAaDelay.text = "${sign}${aaOffsetMs}ms"
@@ -575,8 +420,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyFontSettings() {
-        tvLyrics.textSize = lyricsFontSizeSp.toFloat()
-        tvLyrics.typeface = Typeface.create(lyricsFontFamily, Typeface.NORMAL)
+        lyricsView.setTextSizeSp(lyricsFontSizeSp.toFloat())
+        lyricsView.setTypeface(Typeface.create(lyricsFontFamily, Typeface.NORMAL))
         tvFontSize.text = "${lyricsFontSizeSp}sp"
     }
 
@@ -668,64 +513,11 @@ class MainActivity : AppCompatActivity() {
         return "${sign}${ms}ms"
     }
 
-    private fun startPlainScroll(state: LyricsState) {
-        val durationMs = state.track?.durationMs ?: 0
-        if (durationMs <= 0 || state.lines.isEmpty()) {
-            scrollView.scrollTo(0, 0)
-            return
-        }
-
-        val trackTitle = state.track?.title
-        val isNewTrack = trackTitle != lastPlainTrackTitle
-        lastPlainTrackTitle = trackTitle
-
-        tvLyrics.post {
-            val maxScroll = tvLyrics.height - scrollView.height
-            if (maxScroll <= 0) return@post
-
-            val posMs = try {
-                mediaTracker.getCurrentPositionMs().coerceAtLeast(0)
-            } catch (_: Exception) { 0L }
-            val remainingMs = (durationMs - posMs).coerceAtLeast(0)
-            val startFraction = posMs.toFloat() / durationMs
-            val startScrollY = (startFraction * maxScroll).toInt().coerceIn(0, maxScroll)
-
-            if (isNewTrack || !userScrolling) {
-                scrollView.scrollTo(0, startScrollY)
-            }
-
-            plainScrollAnimator?.cancel()
-            plainScrollAnimator = ValueAnimator.ofInt(startScrollY, maxScroll).apply {
-                duration = remainingMs
-                interpolator = LinearInterpolator()
-                addUpdateListener { anim ->
-                    if (!userScrolling) {
-                        scrollView.scrollTo(0, anim.animatedValue as Int)
-                    }
-                }
-                start()
-                if (!state.isPlaying) pause()
-            }
-        }
-    }
-
-    private fun stopPlainScroll() {
-        plainScrollAnimator?.cancel()
-        plainScrollAnimator = null
-        lastPlainTrackTitle = null
-    }
-
     companion object {
         private val DEFAULT_BG = Color.parseColor("#121212")
         private val DEFAULT_APP_BAR = Color.parseColor("#1E1E2E")
         private val DEFAULT_DELAY_BAR = Color.parseColor("#1A1A2A")
         private val DEFAULT_DIVIDER = Color.parseColor("#2A2A3A")
         private val DEFAULT_HIGHLIGHT = Color.parseColor("#FFD54F")
-        private val DEFAULT_DIM = Color.parseColor("#99FFFFFF")
-
-        private fun setAlpha(color: Int, alpha: Float): Int {
-            val a = (alpha * 255).toInt().coerceIn(0, 255)
-            return Color.argb(a, Color.red(color), Color.green(color), Color.blue(color))
-        }
     }
 }

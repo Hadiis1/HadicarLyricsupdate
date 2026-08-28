@@ -9,6 +9,7 @@ import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import com.autolyrics.lyrics.LrcLibClient
 import com.autolyrics.lyrics.LrcParser
 import com.autolyrics.lyrics.LyricsCache
@@ -24,9 +25,11 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import com.autolyrics.lyrics.EmbeddedLyricsReader
 
 class MediaTracker private constructor(context: Context) {
 
+    private val appContext = context.applicationContext
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val handler = Handler(Looper.getMainLooper())
     private val prefs: SharedPreferences =
@@ -176,6 +179,18 @@ class MediaTracker private constructor(context: Context) {
         activeController?.unregisterCallback(mediaCallback)
         activeController = controller
 
+        controller?.queue?.forEachIndexed { index, item ->
+            val description = item.description
+
+            Log.d("AutoLyricsDebug", "===== QUEUE ITEM $index =====")
+            Log.d("AutoLyricsDebug", "mediaId = ${description.mediaId}")
+            Log.d("AutoLyricsDebug", "mediaUri = ${description.mediaUri}")
+            Log.d("AutoLyricsDebug", "title = ${description.title}")
+            Log.d("AutoLyricsDebug", "subtitle = ${description.subtitle}")
+            Log.d("AutoLyricsDebug", "description = ${description.description}")
+            Log.d("AutoLyricsDebug", "extras = ${description.extras}")
+        }
+
         if (controller == null) {
             handler.removeCallbacks(positionChecker)
             handler.removeCallbacks(trackChangeRunnable)
@@ -191,6 +206,19 @@ class MediaTracker private constructor(context: Context) {
 
     private fun handleMetadataChanged(metadata: MediaMetadata?) {
         if (metadata == null) return
+
+        Log.d("AutoLyricsDebug", "===== METADATA START =====")
+
+        for (key in metadata.keySet()) {
+            val value = metadata.getString(key)
+                ?: metadata.getLong(key).takeIf { it != 0L }
+                ?: metadata.getBitmap(key)
+                ?: metadata.getRating(key)
+
+            Log.d("AutoLyricsDebug", "$key = $value")
+        }
+
+        Log.d("AutoLyricsDebug", "===== METADATA END =====")
 
         val rawTitle = metadata.getString(MediaMetadata.METADATA_KEY_TITLE)
             ?: metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)
@@ -255,10 +283,75 @@ class MediaTracker private constructor(context: Context) {
         }
     }
 
+    private fun fetchEmbeddedLyrics(track: TrackInfo): FetchResult? {
+        return try {
+            val file = MediaStoreAudioFinder.find(
+                context = appContext,
+                title = track.title,
+                artist = track.artist,
+                album = track.album
+            ) ?: return null
+
+            val embedded = EmbeddedLyricsReader.read(file.path)
+
+            if (embedded == null) {
+                return null
+            }
+
+            val lyrics = embedded.lyrics
+            if (lyrics.isNullOrBlank()) {
+                return null
+            }
+
+            val lines = LrcParser.parse(lyrics)
+
+            FetchResult(
+                lines = lines,
+                status = LyricsStatus.FOUND,
+                source = "Embedded"
+            )
+        } catch (e: Exception) {
+            Log.e("AutoLyricsDebug", "Error reading embedded lyrics", e)
+            null
+        }
+    }
+
     private fun fetchLyrics(track: TrackInfo) {
         fetchJob?.cancel()
         fetchJob = scope.launch(Dispatchers.IO) {
             try {
+                val embedded = fetchEmbeddedLyrics(track)
+                if (embedded != null) {
+                    lyricsCache.put(
+                        track.title,
+                        track.artist,
+                        embedded.lines,
+                        embedded.status,
+                        embedded.source
+                    )
+
+                    withContext(Dispatchers.Main) {
+                        if (_state.value.track != track) return@withContext
+
+                        _state.value = _state.value.copy(
+                            lines = embedded.lines,
+                            currentIndex = -1,
+                            currentWordIndex = -1,
+                            status = embedded.status,
+                            source = embedded.source
+                        )
+
+                        if (embedded.status == LyricsStatus.FOUND) {
+                            updateCurrentPosition()
+                        }
+
+                        translateIfNeeded(embedded.lines, track)
+                    }
+
+                    prefetchNextSong()
+                    return@launch
+                }
+
                 val cached = lyricsCache.get(track.title, track.artist)
                 if (cached != null) {
                     val (lines, status, source) = cached
@@ -277,20 +370,34 @@ class MediaTracker private constructor(context: Context) {
                         translateIfNeeded(lines, track)
                     }
 
-                    val cacheAge = lyricsCache.getAge(track.title, track.artist)
+                    val cacheAge = lyricsCache.getAge(
+                        track.title,
+                        track.artist
+                    )
+
                     if (cacheAge < CACHE_REFRESH_MS) {
                         prefetchNextSong()
                         return@launch
                     }
                 }
 
-                val result = fetchFromSyncLrc(track) ?: fetchFromLrcLib(track)
+                val result =
+                    fetchFromSyncLrc(track)
+                        ?: fetchFromLrcLib(track)
 
                 withContext(Dispatchers.Main) {
                     if (_state.value.track != track) return@withContext
 
                     if (result != null) {
-                        lyricsCache.put(track.title, track.artist, result.lines, result.status, result.source)
+
+                        lyricsCache.put(
+                            track.title,
+                            track.artist,
+                            result.lines,
+                            result.status,
+                            result.source
+                        )
+
                         _state.value = _state.value.copy(
                             lines = result.lines,
                             currentIndex = -1,
@@ -313,9 +420,12 @@ class MediaTracker private constructor(context: Context) {
                 prefetchNextSong()
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    if (_state.value.track == track && _state.value.status == LyricsStatus.LOADING) {
+                    if (
+                        _state.value.track == track &&
+                        _state.value.status == LyricsStatus.LOADING
+                    ) {
                         _state.value = _state.value.copy(
                             status = LyricsStatus.ERROR,
                             source = ""

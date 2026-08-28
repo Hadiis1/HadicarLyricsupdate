@@ -81,13 +81,6 @@ object MediaStoreAudioFinder {
                         album = cursor.getString(albumIndex),
                         path = cursor.getString(pathIndex)
                     )
-
-                    Log.d(TAG, "Trovato:")
-                    Log.d(TAG, "  title  = ${result.title}")
-                    Log.d(TAG, "  artist = ${result.artist}")
-                    Log.d(TAG, "  album  = ${result.album}")
-                    Log.d(TAG, "  path   = ${result.path}")
-
                     return result
                 }
             }

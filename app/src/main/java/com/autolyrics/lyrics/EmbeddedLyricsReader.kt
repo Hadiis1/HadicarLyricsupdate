@@ -18,18 +18,8 @@ object EmbeddedLyricsReader {
             val metadata: HashMap<String, String> =
                 TagLib.getMetadata(filePath)
 
-            Log.d(TAG, "===== TAGLIB METADATA =====")
-
-            for ((key, value) in metadata) {
-                Log.d(TAG, "$key = $value")
-            }
-
-            Log.d(TAG, "===== END TAGLIB METADATA =====")
-
             val lyrics = metadata["LYRICS"]
                 ?.takeIf { it.isNotBlank() }
-
-            Log.d(TAG, "LYRICS = ${lyrics ?: "<none>"}")
 
             Result(
                 lyrics = lyrics,
@@ -37,7 +27,6 @@ object EmbeddedLyricsReader {
             )
 
         } catch (e: Exception) {
-            Log.e(TAG, "Errore leggendo metadata: $filePath", e)
             null
         }
     }

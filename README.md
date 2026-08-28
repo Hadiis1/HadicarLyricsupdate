@@ -1,11 +1,13 @@
 # Auto Lyrics
 
-An Android Auto app that displays synced lyrics for the currently playing song, powered by [LRCLIB](https://lrclib.net/).
+An Android Auto app that displays synced lyrics for the currently playing song, with support for lyrics embedded directly in local audio files and online lyrics powered by [LRCLIB](https://lrclib.net/).
 
 ## Features
 
 - **Synced lyrics on Android Auto** — shows the current lyric line with surrounding context, updated in real-time
 - **Works with any music player** — Spotify, YouTube Music, Apple Music, Poweramp, etc.
+- **Embedded lyrics support** — reads synced lyrics directly from MP3, FLAC and Opus files
+- **Offline playback support** — embedded lyrics can be displayed without an Internet connection
 - **Phone companion view** — see lyrics on your phone screen too
 - **Automatic song detection** — picks up whatever is playing via media session APIs
 - **Multi-strategy lyrics lookup** — tries exact match first, falls back to keyword search
